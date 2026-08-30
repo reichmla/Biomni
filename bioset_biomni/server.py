@@ -1,3 +1,4 @@
+import copy
 import json
 import re
 import threading
@@ -378,7 +379,7 @@ def explain():
     total = len(grid)
 
     # Iterates through all combinations
-    for i, (mode, use_markers, use_stats, use_image) in enumerate(grid, 1):
+    for i, (mode, use_markers, use_stats, use_image) in enumerate(grid):
         # Assemble the task json, now we set list to [] if use_markers is false
         task_json = {
             "task": "explain", 
@@ -425,8 +426,88 @@ def explain():
         else:
             print(f'Answer is none in run: {i}/{total}')
 
+    # Second experiment: stats ablation, runs right after the first one
+    _run_stats_ablation(markers, channel_stats, image_b64)
+
     # Same return as before, crashes if we never iterate through the grid (no result is generated then).
     return err if err else jsonify(result)
+
+
+def _run_stats_ablation(markers, channel_stats, image_b64):
+    # Second experiment: ablation over the parts of channel_stats, to see which
+    # ones actually help. Called at the end of /explain. Everything else is
+    # held constant here - mode is fixed to "minimal", markers and image are
+    # always sent - and each run removes exactly one part of channel_stats.
+    if not channel_stats:
+        print("Skipping stats ablation: no channel_stats provided")
+        return
+
+    # The parts we remove one at a time. "baseline" removes nothing.
+    parts = ["baseline", "mean_intensity", "segmented_voxels", "combinations", "non_selected"]
+
+    # Store the data in the same directory as the first experiment
+    results_dir = Path(__file__).parent / "ablation/stats"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    results_path = results_dir / f"explain_stats_{int(time.time())}.jsonl"
+
+    total = len(parts)
+
+    for i, part in enumerate(parts):
+        # Copy the stats and drop the one part for this run
+        stats = copy.deepcopy(channel_stats)
+        channels = stats.get("channels", {})
+
+        if part == "mean_intensity":
+            for ch in channels.values():
+                ch.pop("mean_intensity", None)
+            stats["intensity_available"] = False  # paired flag: leaving it True contradicts the missing values
+
+        if part == "segmented_voxels":
+            for ch in channels.values():
+                ch.pop("segmented_voxels", None)
+
+        if part == "combinations":
+            stats.pop("combinations", None)
+
+        if part == "non_selected":
+            selected = {m.split(":")[0] for m in markers}
+            stats["channels"] = {k: v for k, v in channels.items() if k in selected}
+
+        # Markers, stats and image are always sent
+        task_json = {
+            "task": "explain",
+            "markers": markers,
+            "channel_stats": stats,
+        }
+
+        # Starts the timer
+        start_time = time.time()
+
+        # Run the query on Biomni, mode fixed to "minimal"
+        result, _ = _run(task_json, image_b64, "minimal")
+
+        # End timer, so we know how long the request took
+        elapsed_time = time.time() - start_time
+
+        # Extract answer
+        answer = result.get("answer") if result else None
+
+        record = {
+            "run": i,
+            "removed": part,
+            "answer": answer,
+            "elapsed_s": elapsed_time,
+        }
+
+        # Write result record to results_path
+        with results_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # Log all runs in the ablation
+        if answer is not None:
+            print(f'Run: {i}/{total}, removed={part}, Time: {elapsed_time:.2f}s, Answer: {answer[:80]}')
+        else:
+            print(f'Answer is none in run: {i}/{total} ({part})')
 
 
 def start_server(port: int = 5000, debug: bool = False):
