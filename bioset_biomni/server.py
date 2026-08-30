@@ -1,7 +1,7 @@
 import json
-import os
 import re
 import threading
+import time
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -342,34 +342,90 @@ def bookmark():
 
 @app.post("/explain")
 def explain():
-    """Write a paper-style figure caption for the current viewport.
-
-    Body (JSON):
-        markers       : list[str]  – active markers with colors               (required)
-        channel_stats : dict       – full channel statistics for the region    (optional)
-        mode          : str        – "full" | "db" | "minimal"
-        image         : str        – base64-encoded JPEG or PNG                (optional)
-
-    Returns: {"answer": "..."}
-    """
     err = _check_init()
     if err:
         return err
 
     data = request.get_json(force=True, silent=True) or {}
-    markers, channel_stats, image_b64, mode = _extract_common(data)
 
+    # Extracting data from request as before. We assume that all data is present in the request.
+    markers, channel_stats, image_b64, _ = _extract_common(data)
+
+    # Throw error as before
     if not markers:
         return jsonify({"error": "Missing required field: 'markers'"}), 400
 
-    task_json = {
-        "task": "explain",
-        "markers": markers,
-    }
-    if channel_stats is not None:
-        task_json["channel_stats"] = channel_stats
+    # We iterate through the modes manually
+    modes = ["minimal", "db", "full"]
 
-    result, err = _run(task_json, image_b64, mode)
+    # Leave-one-out: a baseline with everything enabled, then one row per
+    # feature that removes only that feature.
+    feature_sets = [
+        (True, True, True),    # baseline
+        (False, True, True),   # no markers
+        (True, False, True),   # no stats
+        (True, True, False),   # no image
+    ]
+    grid = [(mode, *feats) for mode in modes for feats in feature_sets]
+
+    # Store the data in directory
+    results_dir = Path(__file__).parent / "ablation"
+    # Make sure the dir exists
+    results_dir.mkdir(parents=True, exist_ok=True)
+    results_path = results_dir / f"explain_{int(time.time())}.jsonl"
+
+    runs = []
+    total = len(grid)
+
+    # Iterates through all combinations
+    for i, (mode, use_markers, use_stats, use_image) in enumerate(grid, 1):
+        # Assemble the task json, now we set list to [] if use_markers is false
+        task_json = {
+            "task": "explain", 
+            "markers": markers if use_markers else []
+        }
+
+        # If use_stats, include the channel stats. To make it simpler, we assume they are present
+        if use_stats:
+            task_json["channel_stats"] = channel_stats
+
+        # If use_image, send the image. To make it simpler, we assume it is present
+        img = image_b64 if use_image else None
+
+        # Starts the timer
+        start_time = time.time()
+
+        # Run the query on Biomni
+        result, err = _run(task_json, img, mode)
+
+        # End timer, so we know how long the request took
+        elapsed_time = time.time() - start_time
+
+        # Extract answer
+        answer = result.get("answer") if result else None
+
+        record = {
+            "run": i,
+            "mode": mode,
+            "markers": use_markers,
+            "channel_stats": use_stats,
+            "image": use_image,
+            "answer": answer,
+            "elapsed_s": elapsed_time,
+        }
+        runs.append(record)
+
+        # Write result record to results_path
+        with results_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # Log all runs in the ablations
+        if answer is not None:
+            print(f'Run: {i}/{total}, mode={mode}, m={int(use_markers)}, s={int(use_stats)}, i={int(use_image)}, Time: {elapsed_time:.2f}s, Answer: {answer[:80]}')
+        else:
+            print(f'Answer is none in run: {i}/{total}')
+
+    # Same return as before, crashes if we never iterate through the grid (no result is generated then).
     return err if err else jsonify(result)
 
 
