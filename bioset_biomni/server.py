@@ -15,6 +15,9 @@ app = Flask(__name__)
 
 _agent: A1 | None = None
 _agent_lock = threading.Lock()
+# Parameters from the last successful /init, kept so the agent can be rebuilt
+# (e.g. to switch mode during the /explain ablation).
+_agent_config: dict | None = None
 
 # Max steps per mode for the label endpoint
 _MODE_MAX_STEPS = {
@@ -52,14 +55,26 @@ def _ensure_hgnc(agent: A1) -> None:
     agent.add_data({str(dest): _HGNC_DESCRIPTION})
 
 
-def _parse_solution(text: str) -> dict:
+def _parse_solution(text) -> dict:
     """Extract a JSON object from a <solution> block or bare text.
 
-    Looks for <solution>...</solution> first, then finds the outermost
-    { ... } within it and parses as JSON.
+    minimal mode hands back the raw LLM response, which the graph modes would
+    normally clean up: it can be a list of Anthropic content blocks, and the
+    </solution> stop sequence often chops off the closing tag. Handle both here.
     """
+    if isinstance(text, list):
+        text = "".join(
+            b.get("text", "") for b in text
+            if isinstance(b, dict) and b.get("type") in ("text", "output_text")
+        )
+
     sol_match = re.search(r"<solution>(.*?)</solution>", text, re.DOTALL)
-    content = sol_match.group(1).strip() if sol_match else text.strip()
+    if sol_match:
+        content = sol_match.group(1).strip()
+    else:
+        # No closing tag: take everything after an opening tag, else the whole string.
+        open_match = re.search(r"<solution>(.*)", text, re.DOTALL)
+        content = (open_match.group(1) if open_match else text).strip()
 
     # Find the outermost JSON object
     json_match = re.search(r"\{.*\}", content, re.DOTALL)
@@ -89,18 +104,38 @@ def init():
     dataset = data.get("dataset", DEFAULT_DATASET)
     api_key = data.get("api_key") or None
 
-    global _agent
+    global _agent, _agent_config
     with _agent_lock:
         try:
-            default_config.llm = db_llm
-            kwargs = dict(llm=llm, mode=mode, custom_prompt=build_prompt(dataset))
-            if api_key:
-                kwargs["api_key"] = api_key
-            _agent = A1(**kwargs)
-            _ensure_hgnc(_agent)
+            _agent_config = {
+                "llm": llm,
+                "db_llm": db_llm,
+                "mode": mode,
+                "dataset": dataset,
+                "api_key": api_key,
+            }
+            _agent = _build_agent(mode)
             return jsonify({"status": "ok"})
         except Exception as e:
             return jsonify({"status": "error", "message": str(e)}), 500
+
+
+def _build_agent(mode: str) -> A1:
+    """Construct a fresh A1 agent for `mode` from the stored /init config.
+
+    The /explain ablation calls this before every run so each run starts with a
+    clean context and the mode is the real agent mode, not just a step budget.
+    """
+    if _agent_config is None:
+        raise RuntimeError("Agent not initialised. Call POST /init first.")
+    cfg = _agent_config
+    default_config.llm = cfg["db_llm"]
+    kwargs = dict(llm=cfg["llm"], mode=mode, custom_prompt=build_prompt(cfg["dataset"]))
+    if cfg["api_key"]:
+        kwargs["api_key"] = cfg["api_key"]
+    agent = A1(**kwargs)
+    _ensure_hgnc(agent)
+    return agent
 
 
 def _check_init():
@@ -127,6 +162,16 @@ def _run(task_json: dict, image_b64: str | None, mode: str) -> tuple:
         return None, (jsonify({"error": str(e)}), 422)
     except Exception as e:
         return None, (jsonify({"error": str(e)}), 500)
+
+
+def _err_text(err) -> str:
+    """Pull the message out of an (response, status) error tuple from _run, for logging."""
+    if not err:
+        return "unknown error"
+    try:
+        return err[0].get_json().get("error", str(err))
+    except Exception:
+        return str(err)
 
 
 def _extract_common(data: dict) -> tuple[list | None, dict | None, str | None, str]:
@@ -357,7 +402,7 @@ def explain():
         return jsonify({"error": "Missing required field: 'markers'"}), 400
 
     # We iterate through the modes manually
-    modes = ["minimal", "db", "full"]
+    modes = ["minimal", "full"]
 
     # Leave-one-out: a baseline with everything enabled, then one row per
     # feature that removes only that feature.
@@ -366,6 +411,10 @@ def explain():
         (False, True, True),   # no markers
         (True, False, True),   # no stats
         (True, True, False),   # no image
+        # (False, False, True),   # no markers, stats
+        # (True, False, False),   # no stats, image
+        # (False, True, False),   # no markers, image
+        # (False, False, False) # Nothing
     ]
     grid = [(mode, *feats) for mode in modes for feats in feature_sets]
 
@@ -375,16 +424,24 @@ def explain():
     results_dir.mkdir(parents=True, exist_ok=True)
     results_path = results_dir / f"explain_{int(time.time())}.jsonl"
 
-    runs = []
+    global _agent
     total = len(grid)
 
     # Iterates through all combinations
     for i, (mode, use_markers, use_stats, use_image) in enumerate(grid):
+        # Fresh agent for every run: makes the mode ablation real (tools/prompt/
+        # workflow differ, not just max_steps) and gives each grid cell a clean
+        # context so runs don't contaminate each other.
+        with _agent_lock:
+            _agent = _build_agent(mode)
+
         # Assemble the task json, now we set list to [] if use_markers is false
         task_json = {
-            "task": "explain", 
-            "markers": markers if use_markers else []
+            "task": "explain"
         }
+
+        if use_markers:
+            task_json["markers"] = markers
 
         # If use_stats, include the channel stats. To make it simpler, we assume they are present
         if use_stats:
@@ -411,11 +468,10 @@ def explain():
             "markers": use_markers,
             "channel_stats": use_stats,
             "image": use_image,
+            "task_json": task_json,
             "answer": answer,
             "elapsed_s": elapsed_time,
         }
-        runs.append(record)
-
         # Write result record to results_path
         with results_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -424,10 +480,10 @@ def explain():
         if answer is not None:
             print(f'Run: {i}/{total}, mode={mode}, m={int(use_markers)}, s={int(use_stats)}, i={int(use_image)}, Time: {elapsed_time:.2f}s, Answer: {answer[:80]}')
         else:
-            print(f'Answer is none in run: {i}/{total}')
+            print(f'Answer is none in run: {i}/{total} - {_err_text(err)}')
 
     # Second experiment: stats ablation, runs right after the first one
-    _run_stats_ablation(markers, channel_stats, image_b64)
+    # _run_stats_ablation(markers, channel_stats, image_b64)
 
     # Same return as before, crashes if we never iterate through the grid (no result is generated then).
     return err if err else jsonify(result)
@@ -441,6 +497,13 @@ def _run_stats_ablation(markers, channel_stats, image_b64):
     if not channel_stats:
         print("Skipping stats ablation: no channel_stats provided")
         return
+
+    # Fresh agent in the mode this experiment fixes on (the main grid leaves it
+    # in "full"). One rebuild is enough: minimal mode keeps no context between
+    # runs, so each iteration below already starts clean.
+    global _agent
+    with _agent_lock:
+        _agent = _build_agent("minimal")
 
     # The parts we remove one at a time. "baseline" removes nothing.
     parts = ["baseline", "mean_intensity", "segmented_voxels", "combinations", "non_selected"]
@@ -484,7 +547,7 @@ def _run_stats_ablation(markers, channel_stats, image_b64):
         start_time = time.time()
 
         # Run the query on Biomni, mode fixed to "minimal"
-        result, _ = _run(task_json, image_b64, "minimal")
+        result, err = _run(task_json, image_b64, "minimal")
 
         # End timer, so we know how long the request took
         elapsed_time = time.time() - start_time
@@ -495,6 +558,7 @@ def _run_stats_ablation(markers, channel_stats, image_b64):
         record = {
             "run": i,
             "removed": part,
+            "task_json": task_json,
             "answer": answer,
             "elapsed_s": elapsed_time,
         }
@@ -507,7 +571,7 @@ def _run_stats_ablation(markers, channel_stats, image_b64):
         if answer is not None:
             print(f'Run: {i}/{total}, removed={part}, Time: {elapsed_time:.2f}s, Answer: {answer[:80]}')
         else:
-            print(f'Answer is none in run: {i}/{total} ({part})')
+            print(f'Answer is none in run: {i}/{total} ({part}) - {_err_text(err)}')
 
 
 def start_server(port: int = 5000, debug: bool = False):
@@ -517,4 +581,6 @@ def start_server(port: int = 5000, debug: bool = False):
         port  : TCP port to listen on (default 5000).
         debug : Enable Flask debug mode (default False).
     """
-    app.run(host="0.0.0.0", port=port, debug=debug)
+    # threaded so a long-running /explain ablation doesn't block /init and the
+    # other endpoints (Flask is single-threaded by default).
+    app.run(host="0.0.0.0", port=port, debug=debug, threaded=True)
