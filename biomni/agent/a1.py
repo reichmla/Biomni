@@ -1474,8 +1474,13 @@ Each library is listed with its description to help you understand its functiona
                     # If we found a code block and no solution, treat it as execute
                     execute_match = code_block_match
 
-            # Add the message to the state before checking for errors
-            state["messages"].append(AIMessage(content=msg.strip()))
+            # Add the message to the state before checking for errors. Carry the
+            # response's usage_metadata across — `content` is rebuilt from the
+            # raw blocks, and a plain AIMessage(content=...) would drop the token
+            # counts that `go` reads off the final message.
+            state["messages"].append(
+                AIMessage(content=msg.strip(), usage_metadata=getattr(response, "usage_metadata", None))
+            )
 
             if answer_match:
                 state["next_step"] = "end"
@@ -1867,6 +1872,9 @@ Each library is listed with its description to help you understand its functiona
         self.critic_count = 0
         self.user_task = prompt
 
+        # Token usage for this run, read afterwards as `agent.last_token_usage`.
+        self.last_token_usage = None
+
         # Minimal mode: direct LLM call, no tools, no workflow
         if self.mode == "minimal":
             self.log = []
@@ -1876,6 +1884,7 @@ Each library is listed with its description to help you understand its functiona
             content = response.content if hasattr(response, "content") else str(response)
             self.log.append(content)
             self._conversation_state = None
+            self.last_token_usage = getattr(response, "usage_metadata", None)
             return self.log, content
 
         if self.use_tool_retriever:
@@ -1915,11 +1924,13 @@ Each library is listed with its description to help you understand its functiona
             print(content)
             self.log.append(content)
             self._conversation_state = final_state
+            self.last_token_usage = getattr(synthesis, "usage_metadata", None)
             return self.log, content
 
         # Store the conversation state for markdown generation
         self._conversation_state = final_state
 
+        self.last_token_usage = getattr(message, "usage_metadata", None)
         return self.log, message.content
 
     def go_stream(self, prompt) -> Generator[dict, None, None]:

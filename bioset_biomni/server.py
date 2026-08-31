@@ -459,6 +459,9 @@ def explain():
         # End timer, so we know how long the request took
         elapsed_time = time.time() - start_time
 
+        # Token usage for this run
+        token_usage = _agent.last_token_usage or {}
+
         # Extract answer
         answer = result.get("answer") if result else None
 
@@ -471,6 +474,8 @@ def explain():
             "task_json": task_json,
             "answer": answer,
             "elapsed_s": elapsed_time,
+            "tokens": token_usage.get("total_tokens"),
+            "token_usage": token_usage,
         }
         # Write result record to results_path
         with results_path.open("a", encoding="utf-8") as fh:
@@ -478,7 +483,7 @@ def explain():
 
         # Log all runs in the ablations
         if answer is not None:
-            print(f'Run: {i}/{total}, mode={mode}, m={int(use_markers)}, s={int(use_stats)}, i={int(use_image)}, Time: {elapsed_time:.2f}s, Answer: {answer[:80]}')
+            print(f'Run: {i}/{total}, mode={mode}, m={int(use_markers)}, s={int(use_stats)}, i={int(use_image)}, Time: {elapsed_time:.2f}s, Tokens: {token_usage.get("total_tokens")}, Answer: {answer[:80]}')
         else:
             print(f'Answer is none in run: {i}/{total} - {_err_text(err)}')
 
@@ -552,6 +557,9 @@ def _run_stats_ablation(markers, channel_stats, image_b64):
         # End timer, so we know how long the request took
         elapsed_time = time.time() - start_time
 
+        # Token usage for this run (read right after _run)
+        token_usage = _agent.last_token_usage or {}
+
         # Extract answer
         answer = result.get("answer") if result else None
 
@@ -561,6 +569,8 @@ def _run_stats_ablation(markers, channel_stats, image_b64):
             "task_json": task_json,
             "answer": answer,
             "elapsed_s": elapsed_time,
+            "tokens": token_usage.get("total_tokens"),
+            "token_usage": token_usage,
         }
 
         # Write result record to results_path
@@ -569,7 +579,7 @@ def _run_stats_ablation(markers, channel_stats, image_b64):
 
         # Log all runs in the ablation
         if answer is not None:
-            print(f'Run: {i}/{total}, removed={part}, Time: {elapsed_time:.2f}s, Answer: {answer[:80]}')
+            print(f'Run: {i}/{total}, removed={part}, Time: {elapsed_time:.2f}s, Tokens: {token_usage.get("total_tokens")}, Answer: {answer[:80]}')
         else:
             print(f'Answer is none in run: {i}/{total} ({part}) - {_err_text(err)}')
 
