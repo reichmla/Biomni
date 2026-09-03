@@ -1877,6 +1877,7 @@ Each library is listed with its description to help you understand its functiona
 
         # Minimal mode: direct LLM call, no tools, no workflow
         if self.mode == "minimal":
+            print('Minimal')
             self.log = []
             messages = [SystemMessage(content=self.system_prompt), self._build_human_message(prompt, image)]
             # Invoke without stop sequences so the response is never cut off mid-sentence
@@ -1890,6 +1891,8 @@ Each library is listed with its description to help you understand its functiona
         if self.use_tool_retriever:
             selected_resources_names = self._prepare_resources_for_retrieval(prompt)
             self.update_system_prompt_with_selected_resources(selected_resources_names)
+
+        print('DB/Full')
 
         inputs = {"messages": [self._build_human_message(prompt, image)], "next_step": None}
         config = {"recursion_limit": max_steps, "configurable": {"thread_id": 42}}

@@ -238,14 +238,102 @@ def label():
         return err
 
     data = request.get_json(force=True, silent=True) or {}
-    markers, channel_stats, image_b64, mode = _extract_common(data)
+
+    # Extracting data from request as before. We assume that all data is present in the request.
+    markers, channel_stats, image_b64, _ = _extract_common(data)
+
+    # Throw error as before
     if not markers:
         return jsonify({"error": "Missing required field: 'markers'"}), 400
 
-    task_json = {"task": "label", "markers": markers}
-    if channel_stats:
-        task_json["channel_stats"] = channel_stats
-    result, err = _run(task_json, image_b64, mode)
+    # We iterate through the modes manually
+    modes = ["minimal", "full"]
+
+    # Leave-one-out: a baseline with everything enabled, then one row per
+    # feature that removes only that feature.
+    feature_sets = [
+        (True, True, True),    # baseline
+        (False, True, True),   # no markers
+        (True, False, True),   # no stats
+        (True, True, False),   # no image
+        # (False, False, True),   # no markers, stats
+        # (True, False, False),   # no stats, image
+        # (False, True, False),   # no markers, image
+        # (False, False, False) # Nothing
+    ]
+    grid = [(mode, *feats) for mode in modes for feats in feature_sets]
+
+    # Store the data in directory
+    results_dir = Path(__file__).parent / "ablation" / "label"
+    # Make sure the dir exists
+    results_dir.mkdir(parents=True, exist_ok=True)
+    results_path = results_dir / f"label_{int(time.time())}.jsonl"
+
+    global _agent
+    total = len(grid)
+
+    # Iterates through all combinations
+    for i, (mode, use_markers, use_stats, use_image) in enumerate(grid):
+        # Fresh agent for every run: makes the mode ablation real (tools/prompt/
+        # workflow differ, not just max_steps) and gives each grid cell a clean
+        # context so runs don't contaminate each other.
+        with _agent_lock:
+            _agent = _build_agent(mode)
+
+        # Assemble the task json, now we set list to [] if use_markers is false
+        task_json = {
+            "task": "label"
+        }
+
+        if use_markers:
+            task_json["markers"] = markers
+
+        # If use_stats, include the channel stats. To make it simpler, we assume they are present
+        if use_stats:
+            task_json["channel_stats"] = channel_stats
+
+        # If use_image, send the image. To make it simpler, we assume it is present
+        img = image_b64 if use_image else None
+
+        # Starts the timer
+        start_time = time.time()
+
+        # Run the query on Biomni
+        result, err = _run(task_json, img, mode)
+
+        # End timer, so we know how long the request took
+        elapsed_time = time.time() - start_time
+
+        # Token usage for this run
+        token_usage = _agent.last_token_usage or {}
+
+        # Extract output (label returns "labels"/"overall", so keep the whole dict)
+        output = result if result else None
+
+        record = {
+            "run": i,
+            "task": "label",
+            "mode": mode,
+            "markers": use_markers,
+            "channel_stats": use_stats,
+            "image": use_image,
+            "task_json": task_json,
+            "output": output,
+            "elapsed_s": elapsed_time,
+            "tokens": token_usage.get("total_tokens"),
+            "token_usage": token_usage,
+        }
+        # Write result record to results_path
+        with results_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # Log all runs in the ablations
+        if output is not None:
+            print(f'Run: {i}/{total}, mode={mode}, m={int(use_markers)}, s={int(use_stats)}, i={int(use_image)}, Time: {elapsed_time:.2f}s, Tokens: {token_usage.get("total_tokens")}, Output: {str(output)[:80]}')
+        else:
+            print(f'Output is none in run: {i}/{total} - {_err_text(err)}')
+
+    # Same return as before, crashes if we never iterate through the grid (no result is generated then).
     return err if err else jsonify(result)
 
 
@@ -267,17 +355,107 @@ def query():
         return err
 
     data = request.get_json(force=True, silent=True) or {}
-    markers, channel_stats, image_b64, mode = _extract_common(data)
+
+    # Extracting data from request as before. We assume that all data is present in the request.
+    markers, channel_stats, image_b64, _ = _extract_common(data)
     question = data.get("query") or None
+
+    # Throw error as before
     if not markers:
         return jsonify({"error": "Missing required field: 'markers'"}), 400
     if not question:
         return jsonify({"error": "Missing required field: 'query'"}), 400
 
-    task_json = {"task": "query", "markers": markers, "query": question}
-    if channel_stats:
-        task_json["channel_stats"] = channel_stats
-    result, err = _run(task_json, image_b64, mode)
+    # We iterate through the modes manually
+    modes = ["minimal", "full"]
+
+    # Leave-one-out: a baseline with everything enabled, then one row per
+    # feature that removes only that feature. The question is never ablated -
+    # it is what the endpoint answers.
+    feature_sets = [
+        (True, True, True),    # baseline
+        (False, True, True),   # no markers
+        (True, False, True),   # no stats
+        (True, True, False),   # no image
+        # (False, False, True),   # no markers, stats
+        # (True, False, False),   # no stats, image
+        # (False, True, False),   # no markers, image
+        # (False, False, False) # Nothing
+    ]
+    grid = [(mode, *feats) for mode in modes for feats in feature_sets]
+
+    # Store the data in directory
+    results_dir = Path(__file__).parent / "ablation" / "query"
+    # Make sure the dir exists
+    results_dir.mkdir(parents=True, exist_ok=True)
+    results_path = results_dir / f"query_{int(time.time())}.jsonl"
+
+    global _agent
+    total = len(grid)
+
+    # Iterates through all combinations
+    for i, (mode, use_markers, use_stats, use_image) in enumerate(grid):
+        # Fresh agent for every run: makes the mode ablation real (tools/prompt/
+        # workflow differ, not just max_steps) and gives each grid cell a clean
+        # context so runs don't contaminate each other.
+        with _agent_lock:
+            _agent = _build_agent(mode)
+
+        # Assemble the task json, now we set list to [] if use_markers is false
+        task_json = {
+            "task": "query",
+            "query": question,
+        }
+
+        if use_markers:
+            task_json["markers"] = markers
+
+        # If use_stats, include the channel stats. To make it simpler, we assume they are present
+        if use_stats:
+            task_json["channel_stats"] = channel_stats
+
+        # If use_image, send the image. To make it simpler, we assume it is present
+        img = image_b64 if use_image else None
+
+        # Starts the timer
+        start_time = time.time()
+
+        # Run the query on Biomni
+        result, err = _run(task_json, img, mode)
+
+        # End timer, so we know how long the request took
+        elapsed_time = time.time() - start_time
+
+        # Token usage for this run
+        token_usage = _agent.last_token_usage or {}
+
+        # Extract answer
+        answer = result.get("answer") if result else None
+
+        record = {
+            "run": i,
+            "task": "query",
+            "mode": mode,
+            "markers": use_markers,
+            "channel_stats": use_stats,
+            "image": use_image,
+            "task_json": task_json,
+            "answer": answer,
+            "elapsed_s": elapsed_time,
+            "tokens": token_usage.get("total_tokens"),
+            "token_usage": token_usage,
+        }
+        # Write result record to results_path
+        with results_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # Log all runs in the ablations
+        if answer is not None:
+            print(f'Run: {i}/{total}, mode={mode}, m={int(use_markers)}, s={int(use_stats)}, i={int(use_image)}, Time: {elapsed_time:.2f}s, Tokens: {token_usage.get("total_tokens")}, Answer: {answer[:80]}')
+        else:
+            print(f'Answer is none in run: {i}/{total} - {_err_text(err)}')
+
+    # Same return as before, crashes if we never iterate through the grid (no result is generated then).
     return err if err else jsonify(result)
 
 
@@ -298,14 +476,102 @@ def suggest():
         return err
 
     data = request.get_json(force=True, silent=True) or {}
-    markers, channel_stats, image_b64, mode = _extract_common(data)
+
+    # Extracting data from request as before. We assume that all data is present in the request.
+    markers, channel_stats, image_b64, _ = _extract_common(data)
+
+    # Throw error as before
     if not markers:
         return jsonify({"error": "Missing required field: 'markers'"}), 400
 
-    task_json = {"task": "suggest", "markers": markers}
-    if channel_stats:
-        task_json["channel_stats"] = channel_stats
-    result, err = _run(task_json, image_b64, mode)
+    # We iterate through the modes manually
+    modes = ["minimal", "full"]
+
+    # Leave-one-out: a baseline with everything enabled, then one row per
+    # feature that removes only that feature.
+    feature_sets = [
+        (True, True, True),    # baseline
+        (False, True, True),   # no markers
+        (True, False, True),   # no stats
+        (True, True, False),   # no image
+        # (False, False, True),   # no markers, stats
+        # (True, False, False),   # no stats, image
+        # (False, True, False),   # no markers, image
+        # (False, False, False) # Nothing
+    ]
+    grid = [(mode, *feats) for mode in modes for feats in feature_sets]
+
+    # Store the data in directory
+    results_dir = Path(__file__).parent / "ablation" / "suggest"
+    # Make sure the dir exists
+    results_dir.mkdir(parents=True, exist_ok=True)
+    results_path = results_dir / f"suggest_{int(time.time())}.jsonl"
+
+    global _agent
+    total = len(grid)
+
+    # Iterates through all combinations
+    for i, (mode, use_markers, use_stats, use_image) in enumerate(grid):
+        # Fresh agent for every run: makes the mode ablation real (tools/prompt/
+        # workflow differ, not just max_steps) and gives each grid cell a clean
+        # context so runs don't contaminate each other.
+        with _agent_lock:
+            _agent = _build_agent(mode)
+
+        # Assemble the task json, now we set list to [] if use_markers is false
+        task_json = {
+            "task": "suggest"
+        }
+
+        if use_markers:
+            task_json["markers"] = markers
+
+        # If use_stats, include the channel stats. To make it simpler, we assume they are present
+        if use_stats:
+            task_json["channel_stats"] = channel_stats
+
+        # If use_image, send the image. To make it simpler, we assume it is present
+        img = image_b64 if use_image else None
+
+        # Starts the timer
+        start_time = time.time()
+
+        # Run the query on Biomni
+        result, err = _run(task_json, img, mode)
+
+        # End timer, so we know how long the request took
+        elapsed_time = time.time() - start_time
+
+        # Token usage for this run
+        token_usage = _agent.last_token_usage or {}
+
+        # Extract output (suggest returns "suggestions", so keep the whole dict)
+        output = result if result else None
+
+        record = {
+            "run": i,
+            "task": "suggest",
+            "mode": mode,
+            "markers": use_markers,
+            "channel_stats": use_stats,
+            "image": use_image,
+            "task_json": task_json,
+            "output": output,
+            "elapsed_s": elapsed_time,
+            "tokens": token_usage.get("total_tokens"),
+            "token_usage": token_usage,
+        }
+        # Write result record to results_path
+        with results_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # Log all runs in the ablations
+        if output is not None:
+            print(f'Run: {i}/{total}, mode={mode}, m={int(use_markers)}, s={int(use_stats)}, i={int(use_image)}, Time: {elapsed_time:.2f}s, Tokens: {token_usage.get("total_tokens")}, Output: {str(output)[:80]}')
+        else:
+            print(f'Output is none in run: {i}/{total} - {_err_text(err)}')
+
+    # Same return as before, crashes if we never iterate through the grid (no result is generated then).
     return err if err else jsonify(result)
 
 
@@ -333,23 +599,105 @@ def plot():
     if not isinstance(plot_payload, dict) or not plot_payload:
         return jsonify({"error": "Missing required field: 'plot' (non-empty object)"}), 400
 
-    mode = data.get("mode", "full")
     image_b64 = data.get("image") or None
     markers = data.get("markers") or []
     channel_stats = data.get("channel_stats")
     question = data.get("query") or None
 
-    task_json = {
-        "task": "plot",
-        "plot": plot_payload,
-        "markers": markers,
-    }
-    if channel_stats is not None:
-        task_json["channel_stats"] = channel_stats
-    if question:
-        task_json["query"] = question
+    # We iterate through the modes manually
+    modes = ["minimal", "full"]
 
-    result, err = _run(task_json, image_b64, mode)
+    # Leave-one-out: a baseline with everything enabled, then one row per
+    # feature that removes only that feature. The user question, if any, is
+    # never ablated - it is what the endpoint answers. Tuple order:
+    # (markers, stats, image, plot).
+    feature_sets = [
+        (True, True, True, True),    # baseline
+        (False, True, True, True),   # no markers
+        (True, False, True, True),   # no stats
+        (True, True, False, True),   # no image
+        (True, True, True, False),   # no plot payload
+    ]
+    grid = [(mode, *feats) for mode in modes for feats in feature_sets]
+
+    # Store the data in directory
+    results_dir = Path(__file__).parent / "ablation" / "plot"
+    # Make sure the dir exists
+    results_dir.mkdir(parents=True, exist_ok=True)
+    results_path = results_dir / f"plot_{int(time.time())}.jsonl"
+
+    global _agent
+    total = len(grid)
+
+    # Iterates through all combinations
+    for i, (mode, use_markers, use_stats, use_image, use_plot) in enumerate(grid):
+        # Fresh agent for every run: makes the mode ablation real (tools/prompt/
+        # workflow differ, not just max_steps) and gives each grid cell a clean
+        # context so runs don't contaminate each other.
+        with _agent_lock:
+            _agent = _build_agent(mode)
+
+        # Assemble the task json, dropping the one feature this run ablates
+        task_json = {
+            "task": "plot",
+        }
+        if question:
+            task_json["query"] = question
+
+        # If use_plot, include the plot payload this endpoint explains
+        if use_plot:
+            task_json["plot"] = plot_payload
+
+        if use_markers:
+            task_json["markers"] = markers
+
+        # If use_stats, include the channel stats. To make it simpler, we assume they are present
+        if use_stats:
+            task_json["channel_stats"] = channel_stats
+
+        # If use_image, send the image. To make it simpler, we assume it is present
+        img = image_b64 if use_image else None
+
+        # Starts the timer
+        start_time = time.time()
+
+        # Run the query on Biomni
+        result, err = _run(task_json, img, mode)
+
+        # End timer, so we know how long the request took
+        elapsed_time = time.time() - start_time
+
+        # Token usage for this run
+        token_usage = _agent.last_token_usage or {}
+
+        # Extract answer
+        answer = result.get("answer") if result else None
+
+        record = {
+            "run": i,
+            "task": "plot",
+            "mode": mode,
+            "markers": use_markers,
+            "channel_stats": use_stats,
+            "image": use_image,
+            "plot": use_plot,
+            "task_json": task_json,
+            "answer": answer,
+            "elapsed_s": elapsed_time,
+            "tokens": token_usage.get("total_tokens"),
+            "token_usage": token_usage,
+        }
+        # Write result record to results_path
+        with results_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # Log all runs in the ablations
+        if answer is not None:
+            print(f'Run: {i}/{total}, mode={mode}, m={int(use_markers)}, s={int(use_stats)}, i={int(use_image)}, p={int(use_plot)}, Time: {elapsed_time:.2f}s, Tokens: {token_usage.get("total_tokens")}, Answer: {answer[:80]}')
+        else:
+            print(f'Answer is none in run: {i}/{total} - {_err_text(err)}')
+
+    # Same return as before, crashes if we never iterate through the grid (no result is generated then).
     return err if err else jsonify(result)
 
 
@@ -419,7 +767,7 @@ def explain():
     grid = [(mode, *feats) for mode in modes for feats in feature_sets]
 
     # Store the data in directory
-    results_dir = Path(__file__).parent / "ablation"
+    results_dir = Path(__file__).parent / "ablation" / "explain"
     # Make sure the dir exists
     results_dir.mkdir(parents=True, exist_ok=True)
     results_path = results_dir / f"explain_{int(time.time())}.jsonl"
@@ -467,6 +815,7 @@ def explain():
 
         record = {
             "run": i,
+            "task": "explain",
             "mode": mode,
             "markers": use_markers,
             "channel_stats": use_stats,
